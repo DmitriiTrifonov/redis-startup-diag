@@ -40,10 +40,13 @@ Cluster, который живёт на виртуалках. Если пере�
 | `cmd/netprobe` | Без go-redis. С момента старта пода по очереди коннектится к каждой ноде (dns, dial, AUTH+PING) и показывает, когда сеть «ожила». Режим `-burst N` открывает N соединений на ноду одновременно | H1, H2, H3, H5, H6, H7 |
 | `cmd/startup` | Настоящий go-redis `ClusterClient` с вашими параметрами, холодный старт, N воркеров. Каждую секунду печатает dial'ы (в полёте, латентность, ошибки по причинам), статистику пула, ошибки команд по корзинам и внутренний лог go-redis с таймстемпами. Режимы прогрева `none` / `tcp` (как у вас) / `ping` | H4, H5, H8, H9, H10, H12 |
 | `scripts/vm-check.sh` | На виртуалке с Redis: переполнение listen-очереди, accept-очередь, `maxclients`, `rejected_connections`, лимит fd процесса Redis, conntrack, firewall | H2, H5, H6, H7 |
-| `scripts/node-check.sh` | На k8s-ноде: заполненность conntrack, `insert_failed`/`drop`, ретрансмиты SYN, dmesg, CNI, инструкции для tcpdump | H1, H2, H7 |
+| `scripts/node-check.sh` | На k8s-ноде: заполненность conntrack, `insert_failed`/`drop`, ретрансмиты SYN, dmesg, CNI. С `CAPTURE_SECONDS` ловит SYN/SYN-ACK/RST к Redis и печатает сводку по секундам прямо в stdout, без pcap-файла | H1, H2, H7, F1 |
 | `scripts/failover-test.sh` | Контролируемый `CLUSTER FAILOVER` выбранного слейва с ежесекундным наблюдением за новым мастером: соединения, новые соединения в секунду, отказы, full sync, fork | F1, F2, F4, H6 |
 | `scripts/local-cluster.sh` | Локальный кластер 3+3 на `redis-server`, можно сделать его «слабым» (`TCP_BACKLOG=64 MAXCLIENTS=1500`) и воспроизвести шторм | — |
 | `deploy/k8s/job.yaml` | Job, который запускает всё это в новом поде в вашем неймспейсе | все |
+| `deploy/k8s/node-diag-job.yaml` | Job на конкретной ноде с `hostNetwork`, запускает `node-check.sh` с захватом трафика; результат в `kubectl logs` | H1, H2, H5, H7, F1 |
+| `pkg/redisdiag` | Встраивается в сам сервис: хуки на dial и команды каждой ноды, статистика пулов в логах, журнал событий, HTTP-ручки `/debug/redis/`, `/events`, `/probe` | H4, H5, H8, H9, F1, F2 |
+| `grpcdiag/` | Те же три метода по gRPC, без кодогенерации; `.proto` для `grpcurl` рядом | то же |
 
 Сборка:
 
@@ -56,6 +59,114 @@ docker build -t <registry>/redis-startup-diag:latest .
 Команда `startup` по умолчанию делает только `GET` несуществующих ключей
 (`redis-startup-diag:*`), то есть ничего не пишет. Но она создаёт нагрузку и
 **много соединений**, поэтому на проде начинайте с `-workers 200`.
+
+## Без exec в поды
+
+`kubectl exec` недоступен, а значит, недоступны и `kubectl cp` (он работает
+через exec), и, скорее всего, `kubectl debug`. Поэтому всё здесь устроено так,
+чтобы результат приходил через логи, метрики или сетевые ручки.
+
+| Где смотреть | Как запустить | Как получить результат |
+|---|---|---|
+| Новый под, как у сервиса | `deploy/k8s/job.yaml` | `kubectl logs job/redis-startup-diag` |
+| k8s-нода (conntrack, SNAT, SYN) | `deploy/k8s/node-diag-job.yaml` с `nodeName` и `CAPTURE_SECONDS`, запускать **до** роллаута или failover | `kubectl logs job/redis-node-diag` |
+| Виртуалки с Redis | `scripts/vm-check.sh` по ssh | stdout |
+| Сам сервис, в момент проблемы | `pkg/redisdiag` в коде сервиса | логи сервиса, HTTP или gRPC ручки |
+| Всё остальное | метрики | Prometheus/Grafana, запросы ниже |
+
+`node-diag-job.yaml` требует `hostNetwork` и `NET_ADMIN`/`NET_RAW`, то есть
+уровня Pod Security `privileged`. Если в ваших неймспейсах это запрещено,
+либо попросите платформенную команду запустить его, либо опирайтесь на
+метрики node-exporter (ниже).
+
+### Диагностика внутри сервиса: `pkg/redisdiag`
+
+Самый полезный вариант: сервис сам рассказывает, что происходит с его пулами,
+ровно в момент проблемы — и при старте, и при failover. Подключение:
+
+```go
+rdb := redis.NewClusterClient(opt)
+// сразу после создания, ДО первой команды: OnNewNode видит только новые ноды
+rdiag := redisdiag.InstrumentCluster(rdb, redisdiag.Options{Logger: slog.Default()})
+defer rdiag.Stop()
+
+// HTTP: на внутреннем/админском порту, не на публичном
+adminMux.Handle("/debug/redis/", rdiag.Handler())
+
+// gRPC: на внутреннем сервере (модуль github.com/DmitriiTrifonov/redis-startup-diag/grpcdiag)
+grpcdiag.Register(adminGRPCServer, rdiag)
+```
+
+Что пишется в логи сервиса:
+- `redis dial failed` — каждый неудачный dial: адрес, сколько длился, причина
+  (`timeout_dial`, `refused`, `no_local_port`, ...), сколько dial'ов было в
+  полёте в этот момент;
+- `redis slow dial` — dial дольше 200 мс (настраивается `SlowDial`);
+- `redis pool stats` раз в 5 с по каждой ноде, где что-то изменилось: сколько
+  соединений открыто по требованию, таймауты ожидания пула, всего/idle,
+  максимум одновременных dial'ов, ошибки команд по причинам (`timeout_read`,
+  `moved`, `loading`, `maxclients`, ...);
+- внутренний лог go-redis (перезагрузка топологии, отказы нод).
+
+Ручки:
+
+| HTTP | gRPC (`redisdiag.v1.RedisDiag`) | Что отдаёт |
+|---|---|---|
+| `GET /debug/redis/` | `Snapshot` | опции клиента (без пароля), GOMAXPROCS, по каждой ноде: соединения, открыто по требованию, таймауты пула, dial'ы всего/в полёте/максимум, латентность последних 1024 dial'ов, ошибки по причинам, последние тексты ошибок |
+| `GET /debug/redis/events?last=50` | `Events {"last": 50}` | журнал последних событий с временем: неудачные и медленные dial'ы, создание клиентов нод, всплески пула, внутренний лог go-redis |
+| `GET /debug/redis/probe?timeout=2s` | `Probe {"timeout": "2s"}` | по каждой ноде текущей топологии: свежий TCP-dial мимо пула, `PING` через пул и счётчики из `INFO` (`connected_clients`, `rejected_connections`, `sync_full`, `latest_fork_usec`, ...) |
+
+Проба отвечает на главный вопрос «сеть, пул или Redis?»:
+- `tcp_dial` медленный или с ошибкой → сеть или backlog на VM (H1, H2, H5, H7);
+- `tcp_dial` быстрый, а `pool_ping` медленный или с ошибкой → проблема в
+  пуле или в Redis (H4, H5, H9, F2);
+- оба быстрые, а сервис ловит таймауты → смотреть хуки и CPU (H9, H10).
+
+Проба открывает одно TCP-соединение на ноду и выполняется одна за раз
+(повторный вызов получит 409 / `RESOURCE_EXHAUSTED`).
+
+Как достучаться до ручек без exec:
+- через Service или внутренний ingress на админский порт;
+- `kubectl port-forward pod/<pod> 8090` — это отдельное право
+  (`pods/portforward`), его могут дать, даже если exec запрещён;
+- Job внутри кластера, который сам опрашивает ручки и печатает ответ в лог:
+  `wget -qO- http://<pod-ip>:8090/debug/redis/probe` или
+  `grpcurl -plaintext -import-path /proto -proto redisdiag.proto -d '{}' <pod-ip>:9090 redisdiag.v1.RedisDiag/Probe`.
+
+Попробовать ручки можно на `startup`: `startup -admin-addr :8090 ...`
+поднимает их на этом адресе.
+
+`grpcdiag` вынесен в отдельный Go-модуль, чтобы корневой модуль не тянул
+gRPC. После клонирования: `cd grpcdiag && go mod tidy`. Интеграционный тест:
+`REDIS_ADDRS=127.0.0.1:7000 REDIS_PASSWORD=secret go test ./...`.
+
+Замечание, найденное при тестировании `redisdiag`: команды инициализации
+соединения (`HELLO`, `AUTH`, `CLIENT SETINFO`) проходят через хуки нод.
+Значит, ваши интерсепторы логов, метрик и трейсов выполняются и на каждом
+handshake. При залпе в тысячи соединений это тысячи лишних спанов и записей
+в лог именно в момент перегрузки (см. H9). На Redis < 7.2 `CLIENT SETINFO`
+ещё и возвращает ошибку, которую go-redis игнорирует, а интерсепторы могут
+записать как ошибку команды.
+
+### Метрики вместо exec
+
+Если стоят node-exporter, cAdvisor и redis_exporter (названия метрик зависят
+от версий экспортёров):
+
+| Что | PromQL | Гипотеза |
+|---|---|---|
+| Переполнение accept-очереди на VM с Redis | `rate(node_netstat_TcpExt_ListenOverflows[1m])`, `rate(node_netstat_TcpExt_ListenDrops[1m])` | H5, F1 |
+| SYN cookies на VM | `rate(node_netstat_TcpExt_SyncookiesSent[1m])` | H5, F4 |
+| Ретрансмиты SYN на k8s-нодах | `rate(node_netstat_TcpExt_TCPSynRetrans[1m])` | H1, H2, H5, H7 |
+| Заполненность conntrack на k8s-нодах | `node_nf_conntrack_entries / node_nf_conntrack_entries_limit` | H7 |
+| Гонка SNAT и дропы conntrack | `rate(node_nf_conntrack_stat_insert_failed[1m])`, `rate(node_nf_conntrack_stat_drop[1m])` | H7 |
+| Троттлинг CPU подов | `rate(container_cpu_cfs_throttled_periods_total[1m]) / rate(container_cpu_cfs_periods_total[1m])` | H10 |
+| Соединения и отказы Redis | `redis_connected_clients`, `rate(redis_connections_received_total[1m])`, `rate(redis_rejected_connections_total[1m])` | F1, H6 |
+| Fork на Redis | `redis_latest_fork_seconds` (или аналог `latest_fork_usec`) | F4 |
+
+Смотреть их нужно на окне в несколько минут вокруг старта сервиса или
+failover. Всплеск `connections_received` на одной ноде одновременно с
+`ListenOverflows` на её VM — это прямое подтверждение F1/H4+H5.
 
 ## Гипотезы
 
@@ -540,16 +651,27 @@ failover.
 
 ## План прогона
 
-1. На каждой VM снять `scripts/vm-check.sh` до раскатки.
-2. Запустить `deploy/k8s/job.yaml` (тот же неймспейс, лейблы и ресурсы, что у
-   сервиса). Он выполнит `envreport`, `netprobe`, `netprobe -burst` и `startup`
-   на холодном поде.
-3. Сразу после — `vm-check.sh` на VM и `node-check.sh` на k8s-ноде, где был
-   под. Сравнить счётчики.
-4. Повторить `startup` с `-pool-size 100`, с `-ramp 5s`, с `-warmup ping`.
+Всё без exec: результаты приходят через `kubectl logs`, логи сервиса, метрики
+и ssh на виртуалки.
+
+1. Встроить `pkg/redisdiag` в сервис (логи плюс HTTP или gRPC ручки на
+   админском порту) и раскатить. Это само по себе даст картину при следующем
+   старте или failover.
+2. На каждой VM снять `scripts/vm-check.sh` до эксперимента.
+3. Создать ConfigMap со скриптами и запустить `deploy/k8s/node-diag-job.yaml`
+   на ноде, где живут поды сервиса, с `CAPTURE_SECONDS=600`.
+4. Пока идёт захват: запустить `deploy/k8s/job.yaml` (тот же неймспейс,
+   лейблы и ресурсы, что у сервиса) или сделать `rollout restart` сервиса.
+   Job выполнит `envreport`, `netprobe`, `netprobe -burst` и `startup` на
+   холодном поде.
+5. Сразу после — `vm-check.sh` на VM ещё раз. Сравнить счётчики, прочитать
+   логи обоих Job'ов и `GET /debug/redis/events` у сервиса.
+6. Повторить `startup` с `-pool-size 100`, с `-ramp 5s`, с `-warmup ping`.
    Сравнить.
-5. В самом сервисе: `PoolSize: 100`, прогрев через клиент, readiness после
-   прогрева. Раскатить и посмотреть.
+7. Для failover — сценарий из раздела «Как воспроизвести» выше, с тем же
+   node-diag Job'ом и ручкой `/debug/redis/probe` у сервиса до и после.
+8. В самом сервисе: `PoolSize: 100`, `MaxActiveConns`, прогрев через клиент,
+   readiness после прогрева. Раскатить и посмотреть.
 
 ## Локально
 

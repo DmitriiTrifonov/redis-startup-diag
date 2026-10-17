@@ -17,8 +17,10 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -30,6 +32,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/DmitriiTrifonov/redis-startup-diag/internal/diag"
+	"github.com/DmitriiTrifonov/redis-startup-diag/pkg/redisdiag"
 )
 
 type config struct {
@@ -54,6 +57,7 @@ type config struct {
 	internalLog  bool
 	hookDelay    time.Duration
 	opPause      time.Duration
+	adminAddr    string
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +113,23 @@ func main() {
 		// Simulate slow interceptors (tracing/metrics) on every node client too,
 		// like redisotel does via OnNewNode.
 		rdb.OnNewNode(func(c *redis.Client) { c.AddHook(cmdHook{delay: cfg.hookDelay, nodeOnly: true}) })
+	}
+	if cfg.adminAddr != "" {
+		// Same instrumentation you can embed into the service (pkg/redisdiag),
+		// served over HTTP so it can be read without exec.
+		rd := redisdiag.InstrumentCluster(rdb, redisdiag.Options{
+			Logger:             slog.New(slog.NewTextHandler(os.Stderr, nil)),
+			DisableInternalLog: cfg.internalLog, // keep this tool's own timestamped log
+		})
+		defer rd.Stop()
+		mux := http.NewServeMux()
+		mux.Handle("/debug/redis/", rd.Handler())
+		go func() {
+			fmt.Printf("%s admin HTTP on %s/debug/redis/\n", diag.Since(), cfg.adminAddr)
+			if err := http.ListenAndServe(cfg.adminAddr, mux); err != nil {
+				fmt.Printf("%s admin HTTP: %v\n", diag.Since(), err)
+			}
+		}()
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -167,6 +188,7 @@ func parseFlags() config {
 	flag.BoolVar(&c.internalLog, "internal-log", true, "print go-redis internal logs with timestamps")
 	flag.DurationVar(&c.hookDelay, "hook-delay", 0, "artificial delay inside a command hook (simulates heavy interceptors)")
 	flag.DurationVar(&c.opPause, "op-pause", 0, "pause between ops in each worker (0 = as fast as possible)")
+	flag.StringVar(&c.adminAddr, "admin-addr", "", "serve pkg/redisdiag HTTP endpoints on this address, e.g. :8090")
 	flag.Parse()
 	c.addrs = diag.SplitAddrs(addrs)
 	if len(c.addrs) == 0 {

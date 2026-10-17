@@ -1,0 +1,19 @@
+// Service definition for grpcdiag, for grpcurl / other clients.
+// The server side is registered by hand (no codegen) in grpcdiag.go.
+//
+//   grpcurl -plaintext -import-path grpcdiag -proto redisdiag.proto \
+//       -d '{}' localhost:9090 redisdiag.v1.RedisDiag/Snapshot
+syntax = "proto3";
+
+package redisdiag.v1;
+
+import "google/protobuf/struct.proto";
+
+service RedisDiag {
+  // Client options, per-node pool and dial stats. Request: {}.
+  rpc Snapshot(google.protobuf.Struct) returns (google.protobuf.Struct);
+  // Recent events. Request: {"last": 50} and/or {"since": "2026-10-17T10:00:00Z"}.
+  rpc Events(google.protobuf.Struct) returns (google.protobuf.Struct);
+  // Fresh TCP dial + pooled PING + INFO for every node. Request: {"timeout": "2s"}.
+  rpc Probe(google.protobuf.Struct) returns (google.protobuf.Struct);
+}

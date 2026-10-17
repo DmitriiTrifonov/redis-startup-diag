@@ -1,0 +1,55 @@
+# Node-side diagnostics WITHOUT kubectl exec / cp / debug.
+# Runs scripts/node-check.sh in the host network namespace of one node and
+# prints everything to stdout -> `kubectl logs`.
+#
+# 1. Pick the node where your service pods run:
+#      kubectl -n <ns> get pod -l app=<service> -o wide
+# 2. Put the scripts into a ConfigMap:
+#      kubectl -n <ns> create configmap redis-diag-scripts --from-file=scripts/
+# 3. Set nodeName below, apply, THEN do the rollout restart / failover while
+#    it is capturing:
+#      kubectl -n <ns> apply -f deploy/k8s/node-diag-job.yaml
+#      kubectl -n <ns> rollout restart deploy/<service>
+#      kubectl -n <ns> logs -f job/redis-node-diag
+#
+# Requires a namespace whose Pod Security level allows hostNetwork and the
+# NET_ADMIN/NET_RAW capabilities ("privileged" level). If that is forbidden,
+# ask the platform team to run it, or use the node-exporter queries from the
+# README ("Без exec" section).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-node-diag
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      nodeName: <node-name>          # the node to observe
+      hostNetwork: true              # see the node's conntrack, sockets, SNATed traffic
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists           # allow landing on tainted nodes
+      containers:
+        - name: diag
+          image: nicolaka/netshoot:latest   # mirror it into your registry if needed
+          command: ["bash", "/scripts/node-check.sh", "6379"]
+          env:
+            - name: CAPTURE_SECONDS
+              value: "600"           # capture window; start the rollout/failover inside it
+            - name: REPEAT_EVERY
+              value: "30"            # print conntrack/nstat counters every 30s
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+      volumes:
+        - name: scripts
+          configMap:
+            name: redis-diag-scripts

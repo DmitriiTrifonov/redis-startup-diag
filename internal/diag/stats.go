@@ -107,6 +107,20 @@ func Classify(err error) string {
 		return "unreachable" // no route (network not ready?)
 	case errors.Is(err, io.EOF):
 		return "eof"
+	case strings.Contains(msg, "unknown subcommand 'setinfo'"):
+		return "setinfo_unsupported" // CLIENT SETINFO on Redis < 7.2, ignored by go-redis
+	case strings.HasPrefix(msg, "MOVED "):
+		return "moved" // slot moved (failover / resharding), handled by the cluster client
+	case strings.HasPrefix(msg, "ASK "):
+		return "ask"
+	case strings.HasPrefix(msg, "TRYAGAIN"):
+		return "tryagain"
+	case strings.HasPrefix(msg, "LOADING"):
+		return "loading" // node is loading the dataset (after restart / full sync)
+	case strings.HasPrefix(msg, "READONLY"):
+		return "readonly" // write sent to a replica
+	case strings.HasPrefix(msg, "MASTERDOWN"):
+		return "masterdown"
 	case strings.Contains(msg, "CLUSTERDOWN"):
 		return "clusterdown"
 	case strings.Contains(msg, "NOAUTH") || strings.Contains(msg, "WRONGPASS"):
