@@ -1,0 +1,49 @@
+# Runs the diagnostics in a brand-new pod, i.e. under the same "cold start"
+# conditions as your service. Put it into the SAME namespace, with the SAME
+# labels / NetworkPolicies / node selectors / resources as the service, so the
+# CNI treats it the same way.
+#
+#   kubectl -n <ns> create secret generic redis-diag --from-literal=password=...
+#   kubectl -n <ns> apply -f deploy/k8s/job.yaml
+#   kubectl -n <ns> logs -f job/redis-startup-diag
+#
+# Run it several times (delete + apply): the interesting part is the first
+# seconds of each new pod.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-startup-diag
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: redis-startup-diag
+        # copy the labels your NetworkPolicies select on, e.g.:
+        # app.kubernetes.io/name: my-web-service
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: diag
+          image: <registry>/redis-startup-diag:latest
+          env:
+            - name: REDIS_ADDRS
+              value: "10.0.0.11:6379,10.0.0.12:6379,10.0.0.13:6379,10.0.0.14:6379,10.0.0.15:6379,10.0.0.16:6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: redis-diag, key: password }
+          args:
+            - |
+              envreport -pool-size 10000 -nodes 6 -pods 10
+              # 1) Is the network ready at t=0? One conn at a time for 15s.
+              netprobe -duration 15s
+              # 2) What does a burst of raw connections do? (no go-redis involved)
+              netprobe -duration 0 -burst 500
+              # 3) Real go-redis client, your current settings, cold start, no warmup.
+              #    Read-only GETs. Lower -workers if this is production!
+              startup -pool-size 10000 -workers 1000 -duration 20s -warmup none
+          resources:
+            # same as the service, CPU throttling is one of the hypotheses (H10)
+            requests: { cpu: "500m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "512Mi" }
