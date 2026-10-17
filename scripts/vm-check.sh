@@ -20,6 +20,9 @@ hr "kernel listen/backlog sysctls (H5)"
 sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_syncookies \
        net.ipv4.tcp_abort_on_overflow net.core.netdev_max_backlog 2>/dev/null
 
+hr "transparent huge pages (F4: slow fork) - should be [never]"
+cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+
 hr "listen queue overflows / SYN drops since boot (H5) - compare between runs"
 if command -v nstat >/dev/null; then
   nstat -az TcpExtListenOverflows TcpExtListenDrops TcpExtTCPReqQFullDrop \
@@ -46,6 +49,9 @@ for P in "${PORTS[@]}"; do
     "${R[@]}" INFO clients | grep -E 'connected_clients|blocked_clients|maxclients'
     "${R[@]}" INFO stats | grep -E 'total_connections_received|rejected_connections|instantaneous_ops_per_sec|total_net_input_bytes'
     "${R[@]}" INFO cpu | grep -E 'used_cpu_sys:|used_cpu_user:'
+    hr "port $P: replication / fork (F4)"
+    "${R[@]}" INFO replication | grep -E '^(role|connected_slaves|master_link_status|repl_backlog_size|repl_backlog_histlen):'
+    "${R[@]}" INFO stats | grep -E '^(sync_full|sync_partial_ok|sync_partial_err|latest_fork_usec):'
     hr "port $P: slowlog (last 10)"
     "${R[@]}" SLOWLOG GET 10 | head -60
     hr "port $P: latency doctor"
